@@ -57,32 +57,8 @@ class SequenceEncoder(torch.nn.Module):
         smi_emb = smi_emb.permute(0, 2, 1)  # [512,64,100]
         smi_emb = self.Drug_CNNs(smi_emb)  # [512,160,85]
         smi_emb = self.Drug_max_pool(smi_emb).squeeze(2)
-        file_path = 's.npy'
-        si = smi_emb.cpu()
-        # print(sy.shape)
-        # 检查文件是否存在，存在则加载并追加，不存在则新建
-        if os.path.exists(file_path):
-            existing_data = np.load(file_path)
-            updated_data = np.vstack([existing_data, si])
-        else:
-            updated_data = si
-
-        # 保存到文件
-        np.save(file_path, updated_data)
         smi_emb = self.dropout(smi_emb)
         smi_emb = self.leaky_relu(self.fc(smi_emb))
-        # file_path = 's.npy'
-        # si = smi_emb.cpu()
-        # # print(sy.shape)
-        # # 检查文件是否存在，存在则加载并追加，不存在则新建
-        # if os.path.exists(file_path):
-        #     existing_data = np.load(file_path)
-        #     updated_data = np.vstack([existing_data, si])
-        # else:
-        #     updated_data = si
-        #
-        # # 保存到文件
-        # np.save(file_path, updated_data)
         return smi_emb
 
 
@@ -101,31 +77,7 @@ class FingerEncoder(nn.Module):
         fpn_out = self.fc1(ecfp)
         fpn_out = self.dropout(fpn_out)
         fpn_out = self.act_func(fpn_out)
-        file_path = 'fp.npy'
-        fi = fpn_out.cpu()
-        # print(sy.shape)
-        # 检查文件是否存在，存在则加载并追加，不存在则新建
-        if os.path.exists(file_path):
-            existing_data = np.load(file_path)
-            updated_data = np.vstack([existing_data, fi])
-        else:
-            updated_data = fi
-
-        # 保存到文件
-        np.save(file_path, updated_data)
         fpn_out = self.fc2(fpn_out)
-        # file_path = 'fp.npy'
-        # fi = fpn_out.cpu()
-        # # print(sy.shape)
-        # # 检查文件是否存在，存在则加载并追加，不存在则新建
-        # if os.path.exists(file_path):
-        #     existing_data = np.load(file_path)
-        #     updated_data = np.vstack([existing_data, fi])
-        # else:
-        #     updated_data = fi
-        #
-        # # 保存到文件
-        # np.save(file_path, updated_data)
         return fpn_out
 
 
