@@ -373,41 +373,10 @@ class StructureEncoder(nn.Module):
     def forward(self, h_data,  g, e):
         s_h = self.drug_encoder(h_data)
         h = self.in_feat_dropout(s_h)
-        #隐藏特征输出
-        file_path = 're.npy'
-        sy_path = 'sy.npy'
-        hi = h.cpu()
-        sy = torch.bincount(h_data.batch).cpu().numpy()
-        # print(sy.shape)
-        # 检查文件是否存在，存在则加载并追加，不存在则新建
-        if os.path.exists(file_path):
-            existing_data = np.load(file_path)
-            updated_data = np.vstack([existing_data, hi])
-            existing_sy = np.load(sy_path)
-            updated_sy = np.concatenate([existing_sy, sy])
-        else:
-            updated_data = hi
-            updated_sy = sy
-
-        # 保存到文件
-        np.save(file_path, updated_data)
-        np.save(sy_path, updated_sy)
         e = self.embedding_e(e.float())
         for i,conv in enumerate(self.layers):
             h, e = conv(g, h, e)
         out = self.Fusion(h, h_data)
-        file_path = 'graph.npy'
-        gi = out.cpu()
-        # print(sy.shape)
-        # 检查文件是否存在，存在则加载并追加，不存在则新建
-        if os.path.exists(file_path):
-            existing_data = np.load(file_path)
-            updated_data = np.vstack([existing_data, gi])
-        else:
-            updated_data = gi
-
-        # 保存到文件
-        np.save(file_path, updated_data)
         return out
 
 class MFDL_DDI(nn.Module):
