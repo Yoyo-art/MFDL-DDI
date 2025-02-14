@@ -109,25 +109,12 @@ class MFDL_DDI(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
     def Fusion(self, smi_emb, fp_emb, graph_emb):
-        # CF = torch.concat((smi_emb, fp_emb), -1)
+        
         weights = torch.softmax(torch.cat([self.weight_g, self.weight_s, self.weight_f], dim=0), dim=0)
         w_g, w_s, w_f= weights[0], weights[1],  weights[2]
 
         # Calculate the combined feature H
         CF = w_g * graph_emb + w_s * smi_emb+w_f * fp_emb
-        # CF = torch.concat((smi_emb, fp_emb, graph_emb), -1)
-        # if sa_fe:
-        #     features = CF
-        #     features_cpu = features.cpu()
-        #     labels = np.array(['SMILES'] * smi_emb.shape[0] + ['2D Graph'] * smi_emb.shape[0] + ['Fingerprint'] * smi_emb.shape[0])
-        #     # 保存到文件
-        #     np.save("features.npy", features_cpu.numpy())
-        #     np.save("labels.npy", labels)
-        # CF = CF.view(smi_emb.shape[0], 128, 3).permute(2, 0, 1)
-        # MF = torch.mean(CF, dim=0, keepdim=True)
-        # da, attn_weights = self.self_attn1(MF, CF, CF)
-        # da = self.norm1(da)
-        # outputs = da.squeeze(0)
         return CF
     def forward(self, head_pairs, tail_pairs, rel, label, head_pairs_dgl, tail_pairs_dgl, batch_h_e, batch_t_e, head_smi, tail_smi, head_fp, tail_fp, sa_fe):
         # sequence encoder
@@ -154,13 +141,7 @@ class MFDL_DDI(nn.Module):
 
         score = (pair * rfeat).sum(-1)
 
-        # if sa_fe:
-        #     features = pair
-        #     features_cpu = features.cpu()
-        #     labels = rfeat
-        #     # 保存到文件
-        #     np.save("pairs.npy", features_cpu.numpy())
-        #     np.save("labels.npy", labels)
+        
         if sa_fe:
             return score, pair, h1, t1
         else:
