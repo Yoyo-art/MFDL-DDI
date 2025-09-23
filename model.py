@@ -98,11 +98,11 @@ class MFDL_DDI(nn.Module):
         self.weight_s = nn.Parameter(torch.randn(1))
         self.weight_f = nn.Parameter(torch.randn(1))
 
-        self.mix_layer = nn.MultiheadAttention(embed_dim=hidden_dim*2, num_heads=2, dropout=0.1)
+        self.mix_layer = nn.MultiheadAttention(embed_dim=hidden_dim*4, num_heads=2, dropout=0.1)
 
         self.rmodule = nn.Embedding(86, hidden_dim)
         self.lin = nn.Sequential(
-            nn.Linear(hidden_dim * 2 * 2, hidden_dim * 2),
+            nn.Linear(hidden_dim * 4 * 2, hidden_dim * 2),
             nn.PReLU(),
             # nn.Linear(hidden_dim * 2, hidden_dim * 2),
             # nn.PReLU(),
@@ -110,11 +110,10 @@ class MFDL_DDI(nn.Module):
         )
     def Fusion(self, smi_emb, fp_emb, graph_emb):
         
-        weights = torch.softmax(torch.cat([self.weight_g, self.weight_s, self.weight_f], dim=0), dim=0)
-        w_g, w_s, w_f= weights[0], weights[1],  weights[2]
-
-        # Calculate the combined feature H
-        CF = w_g * graph_emb + w_s * smi_emb+w_f * fp_emb
+        weights = torch.softmax(torch.cat([self.weight_s, self.weight_f], dim=0), dim=0)
+        w_s, w_f = weights[0], weights[1]
+        adaptive_fused = w_s * smi_emb + w_f * fp_emb
+        CF = torch.cat([adaptive_fused, graph_emb], dim=-1)
         return CF
     def forward(self, head_pairs, tail_pairs, rel, label, head_pairs_dgl, tail_pairs_dgl, batch_h_e, batch_t_e, head_smi, tail_smi, head_fp, tail_fp, sa_fe):
         # sequence encoder
@@ -146,3 +145,4 @@ class MFDL_DDI(nn.Module):
             return score, pair, h1, t1
         else:
             return score
+
