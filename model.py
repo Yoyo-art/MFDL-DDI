@@ -22,20 +22,13 @@ class SequenceEncoder(torch.nn.Module):
         self.smi_attention = nn.MultiheadAttention(self.hidden_dim, 4)
         self.Drug_CNNs = nn.Sequential(
             nn.Conv1d(in_channels=self.hidden_dim, out_channels=40, kernel_size=4),
-            # nn.ReLU(),
+            nn.ReLU(),
             nn.Conv1d(in_channels=40, out_channels=40 * 2, kernel_size=6),
-            # nn.ReLU(),
+            nn.ReLU(),
             nn.Conv1d(in_channels=40 * 2, out_channels=40 * 4, kernel_size=8),
-            # nn.ReLU(),
+            nn.ReLU(),
         )
-        # self.Drug_CNNs = nn.Sequential(
-        #     nn.Conv1d(in_channels=hidden_dim, out_channels=40, kernel_size=4, groups=hidden_dim),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=40, out_channels=40 * 2, kernel_size=6, groups=40),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=40 * 2, out_channels=40 * 4, kernel_size=8, groups=40 * 2),
-        #     nn.ReLU(),
-        # )
+       
         self.Drug_max_pool = nn.MaxPool1d(85)
         self.dropout = nn.Dropout(0.1)
         self.leaky_relu = nn.LeakyReLU()
@@ -49,13 +42,13 @@ class SequenceEncoder(torch.nn.Module):
         embedding = embedding + P[:embedding.shape[0], :]
         return embedding
     def forward(self, smi):
-        smi_emb = self.smi_embed(smi)  # [512,100,64]
+        smi_emb = self.smi_embed(smi) 
         # print(smi_emb.shape)
         smi_emb = self.PositionalEncoding(self.hidden_dim, 100, smi_emb)
         # smi_emb, atte = self.smi_attention(smi_emb, smi_emb, smi_emb)
         # print(smi_emb.shape)
-        smi_emb = smi_emb.permute(0, 2, 1)  # [512,64,100]
-        smi_emb = self.Drug_CNNs(smi_emb)  # [512,160,85]
+        smi_emb = smi_emb.permute(0, 2, 1)  
+        smi_emb = self.Drug_CNNs(smi_emb) 
         smi_emb = self.Drug_max_pool(smi_emb).squeeze(2)
         smi_emb = self.dropout(smi_emb)
         smi_emb = self.leaky_relu(self.fc(smi_emb))
@@ -88,15 +81,8 @@ class MFDL_DDI(nn.Module):
         self.finger_encoding = FingerEncoder(hidden_dim*2)
         self.graph_encoding = StructureEncoder(hidden_dim, in_dim, edge_in_dim, n_iter)
 
-        self.self_attn1 = nn.MultiheadAttention(embed_dim=hidden_dim*2, num_heads=2, dropout=0.1)
-        self.norm1 = nn.LayerNorm(hidden_dim*2)
-
-        # self.weight_g = nn.Parameter(torch.randn(1, hidden_dim*2))
-        # self.weight_s = nn.Parameter(torch.randn(1, hidden_dim*2))
-        # self.weight_f = nn.Parameter(torch.randn(1, hidden_dim*2))
         self.weight_g = nn.Parameter(torch.randn(1))
         self.weight_s = nn.Parameter(torch.randn(1))
-        self.weight_f = nn.Parameter(torch.randn(1))
 
         self.mix_layer = nn.MultiheadAttention(embed_dim=hidden_dim*4, num_heads=2, dropout=0.1)
 
@@ -104,16 +90,14 @@ class MFDL_DDI(nn.Module):
         self.lin = nn.Sequential(
             nn.Linear(hidden_dim * 4 * 2, hidden_dim * 2),
             nn.PReLU(),
-            # nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            # nn.PReLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
     def Fusion(self, smi_emb, fp_emb, graph_emb):
         
-        weights = torch.softmax(torch.cat([self.weight_s, self.weight_f], dim=0), dim=0)
-        w_s, w_f = weights[0], weights[1]
-        adaptive_fused = w_s * smi_emb + w_f * fp_emb
-        CF = torch.cat([adaptive_fused, graph_emb], dim=-1)
+        weights = torch.softmax(torch.cat([self.weight_g, self.weight_s], dim=0), dim=0)
+        w_g, w_s = weights[0], weights[1]
+        adaptive_fused = w_s * smi_emb + w_g * graph_emb
+        CF = torch.cat([adaptive_fused, fp_emb], dim=-1)
         return CF
     def forward(self, head_pairs, tail_pairs, rel, label, head_pairs_dgl, tail_pairs_dgl, batch_h_e, batch_t_e, head_smi, tail_smi, head_fp, tail_fp, sa_fe):
         # sequence encoder
@@ -145,4 +129,5 @@ class MFDL_DDI(nn.Module):
             return score, pair, h1, t1
         else:
             return score
+
 
