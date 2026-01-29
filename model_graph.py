@@ -1,67 +1,73 @@
-import dgl.function as fn
-import numpy as np
-import os
-
-from torch_geometric.nn import global_add_pool,global_mean_pool,SAGPooling,global_max_pool
-from torch_geometric.nn.conv import GraphConv
-from torch_geometric.nn.inits import glorot
-from torch_geometric.utils import softmax
-from torch_scatter import scatter
-from torch_geometric.utils import degree
-
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
+from torch_scatter import scatter
+from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool
+from torch_geometric.nn.inits import glorot
+from torch_geometric.utils import degree, softmax as pyg_softmax
 
-def src_dot_dst(src_field, dst_field, out_field):
-    def func(edges):
-        return {out_field: (edges.src[src_field] * edges.dst[dst_field])}
-
-    return func
-
-
-def scaling(field, scale_constant):
-    def func(edges):
-        return {field: ((edges.data[field]) / scale_constant)}
-
-    return func
-
-def imp_exp_attn(implicit_attn, explicit_edge):
-    """
-        implicit_attn: the output of K Q
-        explicit_edge: the explicit edge features
-    """
-
-    def func(edges):
-        return {implicit_attn: (edges.data[implicit_attn] * edges.data[explicit_edge])}
-
-    return func
+import dgl
+import dgl.function as fn
+from dgl.nn.functional import edge_softmax
+import numpy as np
 
 
-def out_edge_features(edge_feat):
-    def func(edges):
-        return {'e_out': edges.data[edge_feat]}
 
-    return func
+class LinearBlock(nn.Module):
 
 
-def exp(field):
-    def func(edges):
-        return {field: torch.exp((edges.data[field].sum(-1, keepdim=True)).clamp(-5, 5))}
+    def __init__(self, n_feats):
+        super().__init__()
+        self.snd_n_feats = 6 * n_feats
 
-    return func
+        self.block = nn.Sequential(
+            nn.BatchNorm1d(n_feats),
+            nn.Linear(n_feats, self.snd_n_feats),
+            # Layer 2 (Residual handled in forward)
+            nn.BatchNorm1d(self.snd_n_feats),
+            nn.PReLU(),
+            nn.Linear(self.snd_n_feats, self.snd_n_feats),
+            # Layer 3 (Residual handled in forward)
+            nn.BatchNorm1d(self.snd_n_feats),
+            nn.PReLU(),
+            nn.Linear(self.snd_n_feats, self.snd_n_feats),
+            # Layer 4 (Residual handled in forward)
+            nn.BatchNorm1d(self.snd_n_feats),
+            nn.PReLU(),
+            nn.Linear(self.snd_n_feats, self.snd_n_feats),
+            # Final
+            nn.BatchNorm1d(self.snd_n_feats),
+            nn.PReLU(),
+            nn.Linear(self.snd_n_feats, n_feats)
+        )
+
+    def forward(self, x):
+        layers = list(self.block)
+
+        out1 = layers[1](layers[0](x))  # lin1
+
+        out2 = layers[4](layers[3](layers[2](out1)))  # lin2
+        out2 = (out2 + out1) / 2  # Residual 1
+
+        out3 = layers[7](layers[6](layers[5](out2)))  # lin3
+        out3 = (out3 + out2) / 2  # Residual 2
+
+        out4 = layers[10](layers[9](layers[8](out3)))  # lin4
+        out4 = (out4 + out3) / 2  # Residual 3
+
+        out5 = layers[13](layers[12](layers[11](out4)))  # lin5
+        return out5
 
 
 class GlobalAttentionPool(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        self.conv = GraphConv(hidden_dim, 1)
+        self.conv = nn.Linear(hidden_dim, 1)  # Simplified to Linear if strictly global attention
 
     def forward(self, x, edge_index, batch):
-        x_conv = self.conv(x, edge_index)
-        scores = softmax(x_conv, batch, dim=0)
-        gx = global_add_pool(x * scores, batch)
-
+        scores = self.conv(x).squeeze(-1)
+        scores = pyg_softmax(scores, batch)
+        gx = global_add_pool(x * scores.unsqueeze(-1), batch)
         return gx
 
 
@@ -69,18 +75,16 @@ class DMPNN(nn.Module):
     def __init__(self, edge_dim, n_feats, n_iter):
         super().__init__()
         self.n_iter = n_iter
-
         self.lin_u = nn.Linear(n_feats, n_feats, bias=False)
         self.lin_v = nn.Linear(n_feats, n_feats, bias=False)
         self.lin_edge = nn.Linear(edge_dim, n_feats, bias=False)
 
         self.att = GlobalAttentionPool(n_feats)
         self.a = nn.Parameter(torch.zeros(1, n_feats, n_iter))
-        self.lin_gout = nn.Linear(n_feats, n_feats)
         self.a_bias = nn.Parameter(torch.zeros(1, 1, n_iter))
+        self.lin_gout = nn.Linear(n_feats, n_feats)
 
         glorot(self.a)
-
         self.lin_block = LinearBlock(n_feats)
 
     def forward(self, data):
@@ -88,73 +92,47 @@ class DMPNN(nn.Module):
         edge_u = self.lin_u(data.x)
         edge_v = self.lin_v(data.x)
         edge_uv = self.lin_edge(data.edge_attr)
+
         edge_attr = (edge_u[edge_index[0]] + edge_v[edge_index[1]] + edge_uv) / 3
         out = edge_attr
 
         out_list = []
         gout_list = []
-        for n in range(self.n_iter):
-            out = scatter(out[data.line_graph_edge_index[0]], data.line_graph_edge_index[1], dim_size=edge_attr.size(0),
-                          dim=0, reduce='add')
-            out = edge_attr + out
-            gout = self.att(out, data.line_graph_edge_index, data.edge_index_batch)
-            out_list.append(out)
-            gout_list.append(F.tanh((self.lin_gout(gout))))
 
+        # Line Graph Message Passing
+        for n in range(self.n_iter):
+            msg = scatter(out[data.line_graph_edge_index[0]], data.line_graph_edge_index[1],
+                          dim_size=edge_attr.size(0), dim=0, reduce='add')
+            out = edge_attr + msg
+
+            # Global Pooling over edges
+            gout = self.att(out, data.line_graph_edge_index, data.edge_index_batch)
+
+            out_list.append(out)
+            gout_list.append(torch.tanh(self.lin_gout(gout)))
+
+        # Aggregation
         gout_all = torch.stack(gout_list, dim=-1)
         out_all = torch.stack(out_list, dim=-1)
+
         scores = (gout_all * self.a).sum(1, keepdim=True) + self.a_bias
         scores = torch.softmax(scores, dim=-1)
-        scores = scores.repeat_interleave(degree(data.edge_index_batch, dtype=data.edge_index_batch.dtype), dim=0)
+
+        deg = degree(data.edge_index_batch, dtype=torch.long)
+        scores = scores.repeat_interleave(deg, dim=0)
+
         out = (out_all * scores).sum(-1)
+
+
         x = data.x + scatter(out, edge_index[1], dim_size=data.x.size(0), dim=0, reduce='add')
         x = self.lin_block(x)
 
         return x
 
 
-class LinearBlock(nn.Module):
-    def __init__(self, n_feats):
-        super().__init__()
-        self.snd_n_feats = 6 * n_feats
-        self.lin1 = nn.Sequential(
-            nn.BatchNorm1d(n_feats),
-            nn.Linear(n_feats, self.snd_n_feats),
-        )
-        self.lin2 = nn.Sequential(
-            nn.BatchNorm1d(self.snd_n_feats),
-            nn.PReLU(),
-            nn.Linear(self.snd_n_feats, self.snd_n_feats),
-        )
-        self.lin3 = nn.Sequential(
-            nn.BatchNorm1d(self.snd_n_feats),
-            nn.PReLU(),
-            nn.Linear(self.snd_n_feats, self.snd_n_feats),
-        )
-        self.lin4 = nn.Sequential(
-            nn.BatchNorm1d(self.snd_n_feats),
-            nn.PReLU(),
-            nn.Linear(self.snd_n_feats, self.snd_n_feats)
-        )
-        self.lin5 = nn.Sequential(
-            nn.BatchNorm1d(self.snd_n_feats),
-            nn.PReLU(),
-            nn.Linear(self.snd_n_feats, n_feats)
-        )
-
-    def forward(self, x):
-        x = self.lin1(x)
-        x = (self.lin3(self.lin2(x)) + x) / 2
-        x = (self.lin4(x) + x) / 2
-        x = self.lin5(x)
-
-        return x
-
-
-class DrugEncoder(torch.nn.Module):
+class DrugEncoder(nn.Module):
     def __init__(self, in_dim, edge_in_dim, hidden_dim, n_iter):
         super().__init__()
-
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.PReLU(),
@@ -164,83 +142,72 @@ class DrugEncoder(torch.nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
         )
-        self.lin0 = nn.Linear(in_dim, hidden_dim)
         self.line_graph = DMPNN(edge_in_dim, hidden_dim, n_iter)
 
     def forward(self, data):
         data.x = self.mlp(data.x)
         x = self.line_graph(data)
-
         return x
+
 
 
 class MultiHeadAttentionLayer(nn.Module):
     def __init__(self, in_dim, out_dim, num_heads, use_bias):
         super().__init__()
-
         self.out_dim = out_dim
         self.num_heads = num_heads
 
-        if use_bias:
-            self.Q = nn.Linear(in_dim, out_dim * num_heads, bias=True)
-            self.K = nn.Linear(in_dim, out_dim * num_heads, bias=True)
-            self.V = nn.Linear(in_dim, out_dim * num_heads, bias=True)
-            self.proj_e = nn.Linear(in_dim, out_dim * num_heads, bias=True)
-        else:
-            self.Q = nn.Linear(in_dim, out_dim * num_heads, bias=False)
-            self.K = nn.Linear(in_dim, out_dim * num_heads, bias=False)
-            self.V = nn.Linear(in_dim, out_dim * num_heads, bias=False)
-            self.proj_e = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+        self.Q = nn.Linear(in_dim, out_dim * num_heads, bias=use_bias)
+        self.K = nn.Linear(in_dim, out_dim * num_heads, bias=use_bias)
+        self.V = nn.Linear(in_dim, out_dim * num_heads, bias=use_bias)
 
-    def propagate_attention(self, g):
+    def forward(self, g, h):
+        # h: [N, d_in]
 
-        # Compute attention score
-        g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score'))  # , edges)
+        # 1. Linear Projections
+        Q_h = self.Q(h).view(-1, self.num_heads, self.out_dim)
+        K_h = self.K(h).view(-1, self.num_heads, self.out_dim)
+        V_h = self.V(h).view(-1, self.num_heads, self.out_dim)
 
-        # scaling
-        g.apply_edges(scaling('score', np.sqrt(self.out_dim)))
+        g.ndata['Q'] = Q_h
+        g.ndata['K'] = K_h
+        g.ndata['V'] = V_h
 
-        # Use available edge features to modify the scores
-        # g.apply_edges(imp_exp_attn('score', 'proj_e'))
+        # 2. Calculate Edge Features & Attention Scores
 
-        # Copy edge features as e_out to be passed to FFN_e
-        g.apply_edges(out_edge_features('score'))
+        g.apply_edges(fn.u_mul_v('K', 'Q', 'score'))
 
-        # softmax
-        g.apply_edges(exp('score'))
+        # Scaling
+        g.edata['score'] = g.edata['score'] / np.sqrt(self.out_dim)
 
-        # Send weighted values to target nodes
-        eids = g.edges()
-        g.send_and_recv(eids, fn.src_mul_edge('V_h', 'score', 'V_h'), fn.sum('V_h', 'wV'))
-        g.send_and_recv(eids, fn.copy_edge('score', 'score'), fn.sum('score', 'z'))
+        # 3. Prepare e_out (Edge Output)
 
-    def forward(self, g, h, e):
+        # e_out = g.edata['score'].view(-1, self.out_dim * self.num_heads)
 
-        Q_h = self.Q(h)
-        K_h = self.K(h)
-        V_h = self.V(h)
-        # proj_e = self.proj_e(e)
 
-        g.ndata['Q_h'] = Q_h.view(-1, self.num_heads, self.out_dim)
-        g.ndata['K_h'] = K_h.view(-1, self.num_heads, self.out_dim)
-        g.ndata['V_h'] = V_h.view(-1, self.num_heads, self.out_dim)
-        # g.edata['proj_e'] = proj_e.view(-1, self.num_heads, self.out_dim)
+        # 4. Prepare Attention Weights (Scalar for Softmax)
 
-        self.propagate_attention(g)
+        attn_score = g.edata['score'].sum(dim=-1, keepdim=True)
 
-        h_out = g.ndata['wV'] / (g.ndata['z'] + torch.full_like(g.ndata['z'], 1e-6))  # adding eps to all values here
-        e_out = g.edata['e_out']
 
-        return h_out, e_out
+        attn_score = torch.clamp(attn_score, min=-5, max=5)
+
+        # 5. Softmax (DGL Optimized)
+
+        attn_weights = edge_softmax(g, attn_score)
+
+        # 6. Aggregation
+        # Message Passing: src_V * edge_attn -> sum -> dst_h
+        g.edata['a'] = attn_weights
+        g.update_all(fn.u_mul_e('V', 'a', 'm'), fn.sum('m', 'wV'))
+
+        h_out = g.ndata['wV'].view(-1, self.out_dim * self.num_heads)
+
+        return h_out
 
 
 class GraphTransformerLayer(nn.Module):
-    """
-        Param:
-    """
-
-    def __init__(self, in_dim, out_dim, num_heads, dropout=0.0, layer_norm=False, batch_norm=True, residual=True,
-                 use_bias=False):
+    def __init__(self, in_dim, out_dim, num_heads, dropout=0.0, layer_norm=False, batch_norm=True, residual=True):
         super().__init__()
 
         self.in_channels = in_dim
@@ -251,151 +218,113 @@ class GraphTransformerLayer(nn.Module):
         self.layer_norm = layer_norm
         self.batch_norm = batch_norm
 
-        self.attention = MultiHeadAttentionLayer(in_dim, out_dim // num_heads, num_heads, use_bias)
+        self.attention = MultiHeadAttentionLayer(in_dim, out_dim // num_heads, num_heads, use_bias=False)
 
         self.O_h = nn.Linear(out_dim, out_dim)
-        self.O_e = nn.Linear(out_dim, out_dim)
+        # self.O_e = nn.Linear(out_dim, out_dim)
 
         if self.layer_norm:
             self.layer_norm1_h = nn.LayerNorm(out_dim)
             self.layer_norm1_e = nn.LayerNorm(out_dim)
-
         if self.batch_norm:
             self.batch_norm1_h = nn.BatchNorm1d(out_dim)
             self.batch_norm1_e = nn.BatchNorm1d(out_dim)
 
-        # FFN for h
-        self.FFN_h_layer1 = nn.Linear(out_dim, out_dim * 2)
-        self.FFN_h_layer2 = nn.Linear(out_dim * 2, out_dim)
-
-        # FFN for e
-        self.FFN_e_layer1 = nn.Linear(out_dim, out_dim * 2)
-        self.FFN_e_layer2 = nn.Linear(out_dim * 2, out_dim)
+        # FFN
+        self.FFN_h = nn.Sequential(
+            nn.Linear(out_dim, out_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim * 2, out_dim)
+        )
+        
 
         if self.layer_norm:
             self.layer_norm2_h = nn.LayerNorm(out_dim)
-            self.layer_norm2_e = nn.LayerNorm(out_dim)
-
+            
         if self.batch_norm:
             self.batch_norm2_h = nn.BatchNorm1d(out_dim)
-            self.batch_norm2_e = nn.BatchNorm1d(out_dim)
+           
 
-    def forward(self, g, h, e):
+    def forward(self, g, h):
+        h_in1= h
+
+        # 1. Normalization (Pre-Norm style is often better, but keeping original Post/Pre logic)
         if self.layer_norm:
             h = self.layer_norm1_h(h)
-            e = self.layer_norm1_e(e)
 
         if self.batch_norm:
             h = self.batch_norm1_h(h)
-            e = self.batch_norm1_e(e)
-        h_in1 = h  # for first residual connection
-        e_in1 = e  # for first residual connection
 
-        # multi-head attention out
-        h_attn_out, e_attn_out = self.attention(g, h, e)
-        h = h_attn_out.view(-1, self.out_channels)
-        e = e_attn_out.view(-1, self.out_channels)
+
+        # 2. Attention
+        h_attn= self.attention(g, h)
+
+        h = self.O_h(h_attn)
+
 
         h = F.dropout(h, self.dropout, training=self.training)
-        e = F.dropout(e, self.dropout, training=self.training)
 
-        h = self.O_h(h)
-        e = self.O_e(e)
 
+        # 3. Residual
         if self.residual:
-            h = h_in1 + h  # residual connection
-            e = e_in1 + e  # residual connection
+            h = h_in1 + h
 
+
+        h_in2= h
+
+        # 4. Normalization 2
         if self.layer_norm:
             h = self.layer_norm2_h(h)
-            e = self.layer_norm2_e(e)
 
         if self.batch_norm:
             h = self.batch_norm2_h(h)
-            e = self.batch_norm2_e(e)
 
-        h_in2 = h  # for second residual connection
-        e_in2 = e  # for second residual connection
-
-        # FFN for h
-        h = self.FFN_h_layer1(h)
-        h = F.relu(h)
-        h = F.dropout(h, self.dropout, training=self.training)
-        h = self.FFN_h_layer2(h)
-
-        # FFN for e
-        e = self.FFN_e_layer1(e)
-        e = F.relu(e)
-        e = F.dropout(e, self.dropout, training=self.training)
-        e = self.FFN_e_layer2(e)
+        # 5. FFN
+        h = self.FFN_h(h)
 
         if self.residual:
-            h = h_in2 + h  # residual connection
-            e = e_in2 + e  # residual connection
+            h = h_in2 + h
 
-        return h,e
-
-    def __repr__(self):
-        return '{}(in_channels={}, out_channels={}, heads={}, residual={})'.format(self.__class__.__name__,
-                                                                                   self.in_channels,
-                                                                                   self.out_channels, self.num_heads,
-                                                                                   self.residual)
+        return h
 
 
 class StructureEncoder(nn.Module):
-    def __init__(self, hidden_dim, in_dim, edge_in_dim, n_iter):
+    def __init__(self, hidden_dim, in_dim, edge_in_dim, n_iter, num_heads=2, n_layers=3, dropout=0.0):
         super().__init__()
-        num_heads = 8
-        dropout = 0.0
-        n_layers = 3
-        self.layer_norm = False
-        self.batch_norm = True
-        self.residual = True
-        self.lap_pos_enc = True
 
         self.drug_encoder = DrugEncoder(in_dim, edge_in_dim, hidden_dim, n_iter)
         self.embedding_e = nn.Linear(edge_in_dim, hidden_dim)
-        self.graph_pred_linear = nn.Identity()
-
+        self.graph_pred_linear = nn.Identity()  # Placeholder if needed
         self.in_feat_dropout = nn.Dropout(dropout)
 
-        self.layers = nn.ModuleList([GraphTransformerLayer(hidden_dim, hidden_dim, num_heads, dropout,
-                                                           self.layer_norm, self.batch_norm, self.residual) for _ in
-                                     range(n_layers - 1)])
-        self.layers.append(GraphTransformerLayer(hidden_dim, hidden_dim, num_heads, dropout, self.layer_norm, self.batch_norm, self.residual))
+        self.layers = nn.ModuleList([
+            GraphTransformerLayer(hidden_dim, hidden_dim, num_heads, dropout)
+            for _ in range(n_layers)
+        ])
 
-    def Fusion(self, sub, data):
+    def fusion(self, sub, data):
+        # Global Pooling
+        # sub: [N, hidden_dim], data.batch: [N]
         Max = global_max_pool(sub, data.batch)
         Mean = global_mean_pool(sub, data.batch)
-        d_g = torch.cat([Max, Mean], dim=-1).type_as(sub)
-        d_g = self.graph_pred_linear(d_g)
+        d_g = torch.cat([Max, Mean], dim=-1)
         return d_g
-    def forward(self, h_data,  g, e):
+
+    def forward(self, h_data, g, e):
+        # 1. PyG MPNN Encoding
         s_h = self.drug_encoder(h_data)
         h = self.in_feat_dropout(s_h)
-        e = self.embedding_e(e.float())
-        for i,conv in enumerate(self.layers):
-            h, e = conv(g, h, e)
-        out = self.Fusion(h, h_data)
+
+        # 2. Edge Embedding
+        # e = self.embedding_e(e.float())
+
+        # 3. DGL Transformer Layers
+        for conv in self.layers:
+            h= conv(g, h)
+
+        # 4. Readout
+        out = self.fusion(h, h_data)
         return out
 
-class MFDL_DDI(nn.Module):
-    def __init__(self, in_dim, edge_in_dim, n_iter, hidden_dim=128):
-        super().__init__()
-        self.graph_encoding = StructureEncoder(hidden_dim, in_dim, edge_in_dim, n_iter)
-        self.rmodule = nn.Embedding(86, hidden_dim)
-        self.lin = nn.Sequential(
-            nn.Linear(hidden_dim * 2 * 1, hidden_dim * 1),
-            nn.PReLU(),
-            nn.Linear(hidden_dim * 1, hidden_dim),
-        )
-    def forward(self, head_pairs, tail_pairs, rel, label, head_pairs_dgl, tail_pairs_dgl, batch_h_e, batch_t_e, head_smi, tail_smi, head_fp, tail_fp):
-        # sequence encoder
-        h_graph_emb = self.graph_encoding(head_pairs, head_pairs_dgl, batch_h_e)
-        t_graph_emb = self.graph_encoding(tail_pairs, tail_pairs_dgl, batch_t_e)
-        pair = torch.cat([h_graph_emb, t_graph_emb], dim=-1)
-        pair = pair.float()
-        rfeat = self.rmodule(rel)
-        score = (self.lin(pair) * rfeat).sum(-1)
 
-        return score
